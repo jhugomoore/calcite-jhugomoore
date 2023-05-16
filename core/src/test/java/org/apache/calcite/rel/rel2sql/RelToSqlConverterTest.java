@@ -54,6 +54,7 @@ import org.apache.calcite.sql.SqlSelect;
 import org.apache.calcite.sql.SqlWriter;
 import org.apache.calcite.sql.SqlWriterConfig;
 import org.apache.calcite.sql.dialect.AnsiSqlDialect;
+import org.apache.calcite.sql.dialect.BigQuerySqlDialect;
 import org.apache.calcite.sql.dialect.CalciteSqlDialect;
 import org.apache.calcite.sql.dialect.HiveSqlDialect;
 import org.apache.calcite.sql.dialect.JethroDataSqlDialect;
@@ -2603,6 +2604,18 @@ class RelToSqlConverterTest {
     sql(query)
         .dialect(HiveSqlDialect.DEFAULT).ok(expected)
         .dialect(MssqlSqlDialect.DEFAULT).ok(mssqlExpected);
+  }
+
+  @Test void testBQSelectLiteralGroupByOrdinal() {
+    final String query = "select 5 as num1, 6 as num2 from \"product\"\n"
+        + "group by 2"
+        + "order by 1";
+    final String expected = "SELECT 5 AS NUM1, 6 AS NUM2\n"
+        + "FROM foodmart.product\n"
+        + "GROUP BY 2\n"
+        + "ORDER BY 5 IS NULL, 1";
+    sql(query)
+        .withBigQuery().ok(expected);
   }
 
   @Test void testHiveSelectQueryWithOverDescAndNullsFirstShouldBeEmulated() {

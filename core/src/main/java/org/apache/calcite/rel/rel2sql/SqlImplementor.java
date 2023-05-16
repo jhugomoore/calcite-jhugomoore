@@ -614,8 +614,8 @@ public abstract class SqlImplementor {
           && dialect.getConformance().isSortByOrdinal()) {
         // An integer literal will be wrongly interpreted as a field ordinal.
         // Convert it to a character literal, which will have the same effect.
-        final String strValue = ((SqlNumericLiteral) node).toValue();
-        return SqlLiteral.createCharString(strValue, node.getParserPosition());
+        return SqlLiteral.createExactNumeric(
+            Integer.toString(ordinal + 1), SqlParserPos.ZERO);
       }
       if (node instanceof SqlCall
           && dialect.getConformance().isSortByOrdinal()) {
