@@ -80,7 +80,6 @@ import org.apache.calcite.sql.SqlUtil;
 import org.apache.calcite.sql.SqlWindow;
 import org.apache.calcite.sql.fun.SqlCase;
 import org.apache.calcite.sql.fun.SqlCountAggFunction;
-import org.apache.calcite.sql.fun.SqlInternalOperators;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.fun.SqlSumEmptyIsZeroAggFunction;
 import org.apache.calcite.sql.parser.SqlParserPos;
@@ -89,7 +88,6 @@ import org.apache.calcite.sql.type.SqlTypeFamily;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.sql.validate.SqlValidatorUtil;
 import org.apache.calcite.util.DateString;
-import org.apache.calcite.util.ImmutableBitSet;
 import org.apache.calcite.util.Pair;
 import org.apache.calcite.util.RangeSets;
 import org.apache.calcite.util.Sarg;
@@ -505,7 +503,7 @@ public abstract class SqlImplementor {
    *
    * <pre>{@code INSERT INTO t1 SELECT x, y + 1 FROM t2}</pre>
    *
-   * <p>rather than with it:
+   * rather than with it:
    *
    * <pre>{@code INSERT INTO t1 SELECT x, y + 1 AS EXPR$0 FROM t2}</pre>
    *
@@ -532,7 +530,7 @@ public abstract class SqlImplementor {
   }
 
   /** Wraps a node in a SELECT statement that has no clauses:
-   * "SELECT ... FROM (node)". */
+   *  "SELECT ... FROM (node)". */
   SqlSelect wrapSelect(SqlNode node) {
     assert node instanceof SqlJoin
         || node instanceof SqlIdentifier
@@ -614,8 +612,8 @@ public abstract class SqlImplementor {
           && dialect.getConformance().isSortByOrdinal()) {
         // An integer literal will be wrongly interpreted as a field ordinal.
         // Convert it to a character literal, which will have the same effect.
-        return SqlLiteral.createExactNumeric(
-            Integer.toString(ordinal + 1), SqlParserPos.ZERO);
+        final String strValue = ((SqlNumericLiteral) node).toValue();
+        return SqlLiteral.createCharString(strValue, node.getParserPosition());
       }
       if (node instanceof SqlCall
           && dialect.getConformance().isSortByOrdinal()) {
@@ -1122,6 +1120,11 @@ public abstract class SqlImplementor {
     }
 
     void addOrderItem(List<SqlNode> orderByList, RelFieldCollation field) {
+      // If the field being ordered on is a Literal value, we can safely skip it.
+      if (!dialect.getConformance().isSortByLiteralAllowed()
+          && field(field.getFieldIndex()) instanceof SqlLiteral) {
+        return;
+      }
       if (field.nullDirection != RelFieldCollation.NullDirection.UNSPECIFIED) {
         final boolean first =
             field.nullDirection == RelFieldCollation.NullDirection.FIRST;
@@ -1169,28 +1172,21 @@ public abstract class SqlImplementor {
     /** Converts a call to an aggregate function to an expression. */
     public SqlNode toSql(AggregateCall aggCall) {
       return toSql(aggCall.getAggregation(), aggCall.isDistinct(),
-          Util.transform(aggCall.rexList, e -> toSql((RexProgram) null, e)),
           Util.transform(aggCall.getArgList(), this::field),
           aggCall.filterArg, aggCall.collation, aggCall.isApproximate());
     }
 
     /** Converts a call to an aggregate function, with a given list of operands,
      * to an expression. */
-    private SqlNode toSql(SqlOperator op, boolean distinct,
-        List<SqlNode> preOperandList, List<SqlNode> operandList,
-        int filterArg, RelCollation collation,
+    private SqlCall toSql(SqlOperator op, boolean distinct,
+        List<SqlNode> operandList, int filterArg, RelCollation collation,
         boolean approximate) {
       final SqlLiteral qualifier =
           distinct ? SqlSelectKeyword.DISTINCT.symbol(POS) : null;
-
-      if (op == SqlInternalOperators.LITERAL_AGG) {
-        return preOperandList.get(0);
-      }
-
       if (op instanceof SqlSumEmptyIsZeroAggFunction) {
         final SqlNode node =
-            toSql(SqlStdOperatorTable.SUM, distinct, preOperandList,
-                operandList, filterArg, collation, approximate);
+            toSql(SqlStdOperatorTable.SUM, distinct, operandList, filterArg,
+                collation, approximate);
         return SqlStdOperatorTable.COALESCE.createCall(POS, node, ZERO);
       }
 
@@ -1214,8 +1210,7 @@ public abstract class SqlImplementor {
         if (operandList.size() > 1) {
           newOperandList.addAll(Util.skip(operandList));
         }
-        return toSql(op, distinct, preOperandList, newOperandList, -1,
-            collation, approximate);
+        return toSql(op, distinct, newOperandList, -1, collation, approximate);
       }
 
       if (op instanceof SqlCountAggFunction && operandList.isEmpty()) {
@@ -1844,26 +1839,15 @@ public abstract class SqlImplementor {
       if (rel instanceof Project) {
         Project project = (Project) rel;
         RelNode input = project.getInput();
-        if (input instanceof Aggregate) {
-          // Cannot merge because "select 1 from t"
-          // is different from "select 1 from (select count(1) from t)"
-          //
-          // Some databases don't allow "GROUP BY ()". On those databases,
-          //   SELECT MIN(1) FROM t
-          // is valid and
-          //   SELECT 1 FROM t GROUP BY ()
-          // is not. So, if an aggregate has no group keys we can only remove
-          // the subquery if there is at least one aggregate function.
-          // See RelToSqlConverter.buildAggregate.
-          final Aggregate aggregate = (Aggregate) input;
-          final ImmutableBitSet fieldsUsed =
-              RelOptUtil.InputFinder.bits(project.getProjects(), null);
-          final boolean hasAggregate =
-              !aggregate.getGroupSet().isEmpty()
-                  || !aggregate.getAggCallList().isEmpty();
-          if (hasAggregate && fieldsUsed.isEmpty()) {
-            return true;
-          }
+        // Cannot merge because "select 1 from t"
+        // is different from "select 1 from (select count(1) from t)"
+        final boolean hasInputRef = project.getProjects()
+            .stream()
+            .anyMatch(rex -> RexUtil.containsInputRef(rex));
+        final boolean hasAggregate =
+            input instanceof Aggregate && input.getRowType().getFieldCount() > 0;
+        if (!hasInputRef && hasAggregate) {
+          return true;
         }
       }
 
@@ -1898,14 +1882,12 @@ public abstract class SqlImplementor {
           return false;
         }
         for (SqlNode sqlNode : orderList) {
-          if (sqlNode instanceof SqlNumericLiteral) {
-            return true;
+          if (!(sqlNode instanceof SqlBasicCall)) {
+            return sqlNode instanceof SqlNumericLiteral;
           }
-          if (sqlNode instanceof SqlBasicCall) {
-            for (SqlNode operand : ((SqlBasicCall) sqlNode).getOperandList()) {
-              if (operand instanceof SqlNumericLiteral) {
-                return true;
-              }
+          for (SqlNode operand : ((SqlBasicCall) sqlNode).getOperandList()) {
+            if (operand instanceof SqlNumericLiteral) {
+              return true;
             }
           }
         }
